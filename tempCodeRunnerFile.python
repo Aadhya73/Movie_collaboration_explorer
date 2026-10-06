@@ -1,0 +1,787 @@
+import streamlit as st
+import pandas as pd
+import networkx as nx
+import json
+import itertools
+from pyvis.network import Network
+import streamlit.components.v1 as components
+
+
+# =========================================================
+# PAGE CONFIGURATION
+# =========================================================
+
+st.set_page_config(
+    page_title="Movie Collaboration Explorer",
+    page_icon="🎬",
+    layout="wide"
+)
+
+
+# =========================================================
+# TITLE
+# =========================================================
+
+st.title("🎬 Movie Collaboration Explorer")
+
+st.markdown(
+    """
+    **Explore how actors are connected through movies.**
+
+    Each actor is represented as a **node** and actors who appeared
+    together in a movie are connected by an **edge**.
+    """
+)
+
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+
+@st.cache_data
+def load_data():
+
+    credits = pd.read_csv(
+        "data/tmdb_5000_credits.csv"
+    )
+
+    movies = pd.read_csv(
+        "data/tmdb_5000_movies.csv"
+    )
+
+    # Merge both datasets
+    data = movies.merge(
+        credits,
+        left_on="id",
+        right_on="movie_id",
+        how="inner"
+    )
+
+    return data
+
+
+data = load_data()
+
+
+# =========================================================
+# DATA PREPROCESSING
+# =========================================================
+
+def parse_json(value):
+
+    try:
+        return json.loads(value)
+    except:
+        return []
+
+
+def extract_cast(cast_string, max_actors=8):
+
+    cast = parse_json(cast_string)
+
+    actors = []
+
+    for person in cast[:max_actors]:
+
+        if "name" in person:
+            actors.append(person["name"])
+
+    return actors
+
+
+# Extract year
+data["release_date"] = pd.to_datetime(
+    data["release_date"],
+    errors="coerce"
+)
+
+data["year"] = data["release_date"].dt.year
+
+
+# Extract genres
+def extract_genres(genre_string):
+
+    genres = parse_json(genre_string)
+
+    return [
+        genre["name"]
+        for genre in genres
+        if "name" in genre
+    ]
+
+
+data["genre_list"] = data["genres"].apply(
+    extract_genres
+)
+
+
+# Extract actors
+data["actor_list"] = data["cast"].apply(
+    lambda x: extract_cast(x, 8)
+)
+
+
+# =========================================================
+# SIDEBAR FILTERS
+# =========================================================
+
+st.sidebar.header("🎛️ Filters")
+
+
+# ---------- YEAR FILTER ----------
+
+valid_years = data["year"].dropna()
+
+if len(valid_years) > 0:
+
+    min_year = int(valid_years.min())
+    max_year = int(valid_years.max())
+
+    year_range = st.sidebar.slider(
+        "Release Year",
+        min_value=min_year,
+        max_value=max_year,
+        value=(max(min_year, 2000), max_year)
+    )
+
+else:
+
+    year_range = (1900, 2025)
+
+
+# ---------- GENRE FILTER ----------
+
+all_genres = sorted(
+    set(
+        genre
+        for genres in data["genre_list"]
+        for genre in genres
+    )
+)
+
+selected_genres = st.sidebar.multiselect(
+    "Genre",
+    all_genres,
+    default=[]
+)
+
+
+# ---------- ACTORS PER MOVIE ----------
+
+actors_per_movie = st.sidebar.slider(
+    "Actors considered per movie",
+    min_value=3,
+    max_value=10,
+    value=8
+)
+
+
+# ---------- MINIMUM COLLABORATIONS ----------
+
+min_collaboration = st.sidebar.slider(
+    "Minimum shared movies",
+    min_value=1,
+    max_value=5,
+    value=2
+)
+
+
+# ---------- MAXIMUM NODES ----------
+
+max_nodes = st.sidebar.slider(
+    "Maximum actors displayed",
+    min_value=30,
+    max_value=200,
+    value=100
+)
+
+
+# =========================================================
+# APPLY FILTERS
+# =========================================================
+
+filtered_data = data[
+    (data["year"] >= year_range[0]) &
+    (data["year"] <= year_range[1])
+].copy()
+
+
+# Genre filtering
+if selected_genres:
+
+    filtered_data = filtered_data[
+        filtered_data["genre_list"].apply(
+            lambda genres:
+            any(
+                genre in genres
+                for genre in selected_genres
+            )
+        )
+    ]
+
+
+# Re-extract actors according to slider
+filtered_data["actor_list"] = filtered_data["cast"].apply(
+    lambda x: extract_cast(x, actors_per_movie)
+)
+
+
+# =========================================================
+# BUILD ACTOR COLLABORATION GRAPH
+# =========================================================
+
+@st.cache_data
+def build_graph(movie_data, minimum_collaboration):
+
+    G = nx.Graph()
+
+    for _, movie in movie_data.iterrows():
+
+        actors = movie["actor_list"]
+
+        # Remove duplicates
+        actors = list(dict.fromkeys(actors))
+
+        # Add actors as nodes
+        for actor in actors:
+
+            if not G.has_node(actor):
+
+                G.add_node(
+                    actor,
+                    movies=[]
+                )
+
+            G.nodes[actor]["movies"].append(
+                movie["title_x"]
+            )
+
+        # Create actor pairs
+        for actor1, actor2 in itertools.combinations(
+            actors, 2
+        ):
+
+            if G.has_edge(actor1, actor2):
+
+                G[actor1][actor2]["weight"] += 1
+
+                G[actor1][actor2]["movies"].append(
+                    movie["title_x"]
+                )
+
+            else:
+
+                G.add_edge(
+                    actor1,
+                    actor2,
+                    weight=1,
+                    movies=[movie["title_x"]]
+                )
+
+    # Remove weak collaborations
+    edges_to_remove = [
+        (
+            u,
+            v
+        )
+        for u, v, attributes in G.edges(data=True)
+        if attributes["weight"] < minimum_collaboration
+    ]
+
+    G.remove_edges_from(edges_to_remove)
+
+    # Remove isolated actors
+    isolated = list(nx.isolates(G))
+
+    G.remove_nodes_from(isolated)
+
+    return G
+
+
+G = build_graph(
+    filtered_data,
+    min_collaboration
+)
+
+
+# =========================================================
+# LIMIT GRAPH SIZE
+# =========================================================
+
+if len(G.nodes) > max_nodes:
+
+    # Keep actors with highest degree
+    important_nodes = sorted(
+        G.degree,
+        key=lambda x: x[1],
+        reverse=True
+    )[:max_nodes]
+
+    important_nodes = [
+        node
+        for node, degree in important_nodes
+    ]
+
+    G = G.subgraph(
+        important_nodes
+    ).copy()
+
+
+# =========================================================
+# COMMUNITY DETECTION
+# =========================================================
+
+if len(G.nodes) > 0:
+
+    communities = nx.community.greedy_modularity_communities(
+        G
+    )
+
+    community_map = {}
+
+    for community_id, community in enumerate(
+        communities
+    ):
+
+        for actor in community:
+
+            community_map[actor] = community_id
+
+else:
+
+    community_map = {}
+
+
+# =========================================================
+# NETWORK STATISTICS
+# =========================================================
+
+number_of_actors = len(G.nodes)
+number_of_connections = len(G.edges)
+
+if number_of_actors > 1:
+
+    density = nx.density(G)
+
+else:
+
+    density = 0
+
+
+# =========================================================
+# TOP ACTORS
+# =========================================================
+
+degree_data = pd.DataFrame(
+    G.degree,
+    columns=[
+        "Actor",
+        "Connections"
+    ]
+)
+
+degree_data = degree_data.sort_values(
+    "Connections",
+    ascending=False
+)
+
+
+# =========================================================
+# TOP ACTORS SECTION
+# =========================================================
+
+st.subheader("📊 Network Overview")
+
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+
+    st.metric(
+        "Actors",
+        number_of_actors
+    )
+
+with col2:
+
+    st.metric(
+        "Connections",
+        number_of_connections
+    )
+
+with col3:
+
+    st.metric(
+        "Movies",
+        len(filtered_data)
+    )
+
+with col4:
+
+    st.metric(
+        "Network Density",
+        f"{density:.3f}"
+    )
+
+
+# =========================================================
+# ACTOR SEARCH
+# =========================================================
+
+st.sidebar.subheader("🔎 Actor Search")
+
+actor_names = sorted(
+    G.nodes()
+)
+
+selected_actor = st.sidebar.selectbox(
+    "Select an actor",
+    ["None"] + actor_names
+)
+
+
+# =========================================================
+# PYVIS NETWORK
+# =========================================================
+
+st.subheader("🕸️ Actor Collaboration Network")
+
+if len(G.nodes) == 0:
+
+    st.warning(
+        "No actors found with the current filters. "
+        "Try reducing the minimum collaboration value "
+        "or changing the filters."
+    )
+
+else:
+
+    net = Network(
+        height="650px",
+        width="100%",
+        bgcolor="#111827",
+        font_color="white",
+        notebook=False,
+        cdn_resources="in_line"
+    )
+
+    net.barnes_hut(
+        gravity=-3000,
+        central_gravity=0.3,
+        spring_length=150,
+        spring_strength=0.02,
+        damping=0.09
+    )
+
+    # Add nodes
+    for actor in G.nodes():
+
+        degree = G.degree(actor)
+
+        community = community_map.get(
+            actor,
+            0
+        )
+
+        movie_count = len(
+            set(
+                G.nodes[actor].get(
+                    "movies",
+                    []
+                )
+            )
+        )
+
+        # Bigger node = more connections
+        node_size = 10 + degree * 2
+
+        title = f"""
+        <b>{actor}</b><br>
+        Connections: {degree}<br>
+        Movies in filtered network: {movie_count}<br>
+        Community: {community + 1}
+        """
+
+        net.add_node(
+            actor,
+            label=actor,
+            size=node_size,
+            title=title,
+            group=community
+        )
+
+    # Add edges
+    for actor1, actor2, attributes in G.edges(
+        data=True
+    ):
+
+        weight = attributes["weight"]
+
+        movie_names = attributes.get(
+            "movies",
+            []
+        )
+
+        movie_text = "<br>".join(
+            list(
+                dict.fromkeys(movie_names)
+            )[:8]
+        )
+
+        title = f"""
+        <b>Collaboration</b><br>
+        {actor1} + {actor2}<br>
+        Shared movies: {weight}<br><br>
+        {movie_text}
+        """
+
+        net.add_edge(
+            actor1,
+            actor2,
+            value=weight,
+            title=title
+        )
+
+    # Highlight selected actor
+    if selected_actor != "None":
+
+        for node in net.nodes:
+
+            if node["id"] == selected_actor:
+
+                node["color"] = "#ffcc00"
+                node["size"] = 30
+
+    # Save network
+    net.save_graph(
+        "movie_network.html"
+    )
+
+    with open(
+        "movie_network.html",
+        "r",
+        encoding="utf-8"
+    ) as file:
+
+        html = file.read()
+
+    components.html(
+        html,
+        height=670,
+        scrolling=True
+    )
+
+
+# =========================================================
+# SELECTED ACTOR DETAILS
+# =========================================================
+
+if selected_actor != "None":
+
+    st.subheader(
+        f"👤 Selected Actor: {selected_actor}"
+    )
+
+    actor_degree = G.degree(
+        selected_actor
+    )
+
+    neighbours = list(
+        G.neighbors(
+            selected_actor
+        )
+    )
+
+    actor_movies = set(
+        G.nodes[selected_actor].get(
+            "movies",
+            []
+        )
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+
+        st.metric(
+            "Connections",
+            actor_degree
+        )
+
+    with col2:
+
+        st.metric(
+            "Movies",
+            len(actor_movies)
+        )
+
+    with col3:
+
+        st.metric(
+            "Community",
+            community_map.get(
+                selected_actor,
+                0
+            ) + 1
+        )
+
+
+    # ---------------------------------------------
+    # TOP COLLABORATORS
+    # ---------------------------------------------
+
+    st.markdown(
+        "### 🤝 Top Collaborators"
+    )
+
+    collaborator_data = []
+
+    for collaborator in neighbours:
+
+        shared_movies = G[
+            selected_actor
+        ][
+            collaborator
+        ]["weight"]
+
+        collaborator_data.append(
+            {
+                "Actor": collaborator,
+                "Shared Movies": shared_movies
+            }
+        )
+
+    collaborator_df = pd.DataFrame(
+        collaborator_data
+    )
+
+    if not collaborator_df.empty:
+
+        collaborator_df = collaborator_df.sort_values(
+            "Shared Movies",
+            ascending=False
+        )
+
+        st.dataframe(
+            collaborator_df.head(10),
+            use_container_width=True,
+            hide_index=True
+        )
+
+
+# =========================================================
+# TOP CONNECTED ACTORS
+# =========================================================
+
+st.subheader(
+    "🏆 Most Connected Actors"
+)
+
+if not degree_data.empty:
+
+    st.bar_chart(
+        degree_data.head(10).set_index(
+            "Actor"
+        )
+    )
+
+
+# =========================================================
+# MOVIE DATA
+# =========================================================
+
+st.subheader(
+    "🎥 Movies in Current Selection"
+)
+
+movie_display = filtered_data[
+    [
+        "title_x",
+        "year",
+        "genre_list"
+    ]
+].copy()
+
+movie_display["Genres"] = movie_display[
+    "genre_list"
+].apply(
+    lambda x: ", ".join(x)
+)
+
+movie_display = movie_display[
+    [
+        "title_x",
+        "year",
+        "Genres"
+    ]
+]
+
+movie_display.columns = [
+    "Movie",
+    "Year",
+    "Genres"
+]
+
+st.dataframe(
+    movie_display.head(100),
+    use_container_width=True,
+    hide_index=True
+)
+
+
+# =========================================================
+# PROJECT EXPLANATION
+# =========================================================
+
+with st.expander(
+    "📚 How this visualisation works"
+):
+
+    st.markdown(
+        """
+        ### Graph Model
+
+        - **Vertex / Node:** Actor
+        - **Edge:** Two actors appeared in the same movie
+        - **Edge weight:** Number of movies shared by two actors
+        - **Node size:** Number of actor connections
+        - **Node colour:** Detected community
+        - **Edge thickness:** Collaboration strength
+
+        ### Visualisation Principles
+
+        **Connectedness:**  
+        Actors who collaborated are connected by edges.
+
+        **Proximity:**  
+        Related actors are positioned near one another in the network.
+
+        **Similarity:**  
+        Actors belonging to the same detected community share a visual group.
+
+        ### Interaction
+
+        The application provides:
+
+        - Zoom
+        - Pan
+        - Node dragging
+        - Actor search
+        - Year filtering
+        - Genre filtering
+        - Collaboration filtering
+        - Actor details
+        - Top collaborator analysis
+        """
+    )
+
+
+# =========================================================
+# FOOTER
+# =========================================================
+
+st.markdown("---")
+
+st.caption(
+    "Movie Collaboration Explorer | "
+    "Interactive Graph Visualisation Project"
+)
